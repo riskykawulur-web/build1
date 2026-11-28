@@ -1,0 +1,315 @@
+name: Build Super Cepat
+
+# Dipakai tombol BUILD SUPER CEPAT di bot. Flutter RELEASE saja, semua yang tidak
+# perlu dibuang: tanpa apt-get, tanpa setup-java, tanpa setup-android (bawaan runner),
+# tanpa install Gradle manual, tanpa sanitize icon (hanya kalau build gagal karena AAPT2),
+# hanya arm64, cache Flutter/Pub/Gradle, artifact tanpa kompresi.
+
+on:
+  push:
+    branches:
+      - build
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CI: true
+  FLUTTER_SUPPRESS_ANALYTICS: true
+  DART_DISABLE_TELEMETRY: true
+  PUB_ENVIRONMENT: github_actions
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout (ringan)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # 1 step: unduh ZIP -> ekstrak -> ratakan -> deteksi versi Flutter dari pubspec
+      - name: Siapkan project dan deteksi versi Flutter
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          URL=$(jq -r '.zip_url // empty' build-config.json 2>/dev/null || true)
+          if [ -n "$URL" ]; then
+            curl -fsSL --retry 3 -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" -o flutter-project.zip "$URL"
+          fi
+          [ -f flutter-project.zip ] || { echo "flutter-project.zip tidak ada"; exit 1; }
+          rm -rf flutter-project && mkdir flutter-project
+          unzip -q -o flutter-project.zip -d flutter-project
+          rm -f flutter-project.zip
+          if [ ! -f flutter-project/pubspec.yaml ]; then
+            SUB=$(find flutter-project -mindepth 2 -maxdepth 2 -name pubspec.yaml | head -n1 | xargs -r dirname)
+            [ -n "$SUB" ] || { echo "pubspec.yaml tidak ditemukan"; exit 1; }
+            mv "$SUB" flutter-tmp && rm -rf flutter-project && mv flutter-tmp flutter-project
+          fi
+          python3 - <<'PY'
+          import os, re
+          t = open('flutter-project/pubspec.yaml', encoding='utf-8', errors='ignore').read()
+          m = re.search(r'^environment:[ \t]*\n(?:[ \t]+[^\n]*\n)*?[ \t]+sdk:[ \t]*["\']?([^"\'\n#]+)', t, re.M)
+          mm = re.search(r'(\d+)\.(\d+)', m.group(1)) if m else None
+          table = {(3,0):'3.10.0',(3,1):'3.13.0',(3,2):'3.16.0',(3,3):'3.19.0',(3,4):'3.22.0',(3,5):'3.24.0',(3,6):'3.27.0',(3,7):'3.29.0'}
+          v = '3.27.0'
+          if mm:
+              a, b = int(mm.group(1)), int(mm.group(2))
+              v = '3.35.2' if (a == 3 and b >= 8) else table.get((a, b), '3.27.0')
+          plugins = [
+              r'webview_flutter:\s*[\^>=]*(4\.(1[5-9]|[2-9]\d)|5\.)',
+              r'geolocator:\s*[\^>=]*1[45]\.',
+              r'google_maps_flutter:\s*[\^>=]*(2\.(1\d|[2-9]\d)|3\.)',
+              r'firebase_\w+:\s*[\^>=]*3\.',
+              r'flutter_local_notifications:\s*[\^>=]*17\.',
+              r'workmanager:\s*[\^>=]*0\.[6-9]',
+              r'image_picker:\s*[\^>=]*1\.([2-9]\d)',
+              r'file_picker:\s*[\^>=]*8\.',
+              r'permission_handler:\s*[\^>=]*12\.',
+          ]
+          if any(re.search(p, t) for p in plugins):
+              v = '3.35.2'
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write('FLUTTER_VERSION=%s\n' % v)
+          print('Flutter dipilih:', v)
+          PY
+
+      # JDK 17 sudah ada di runner, tinggal diarahkan (tanpa setup-java)
+      - name: Pakai JDK 17 bawaan runner
+        shell: bash
+        run: |
+          if [ -n "${JAVA_HOME_17_X64:-}" ]; then
+            echo "JAVA_HOME=${JAVA_HOME_17_X64}" >> $GITHUB_ENV
+            echo "${JAVA_HOME_17_X64}/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Setup Flutter SDK (cache)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ env.FLUTTER_VERSION }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Build APK release (arm64)
+        shell: bash
+        run: |
+          set -eo pipefail
+          cd flutter-project
+
+          # android/ hilang atau tidak lengkap -> lengkapi otomatis (tidak menimpa file yang ada)
+          if [ ! -f android/app/src/main/AndroidManifest.xml ] || { [ ! -f android/settings.gradle ] && [ ! -f android/settings.gradle.kts ]; }; then
+            echo "android/ tidak lengkap, dilengkapi lewat flutter create"
+            NAME=$(sed -n 's/^name:[[:space:]]*//p' pubspec.yaml | head -n1 | tr -d "\"' \r")
+            # nama untuk flutter create harus valid Dart package: huruf kecil, angka, underscore
+            ORIG_NAME="$NAME"
+            NAME=$(printf '%s' "$NAME" | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9_]+/_/g; s/^_+//; s/_+$//')
+            [ -n "$NAME" ] || NAME="app"
+            case "$NAME" in [0-9]*) NAME="app_$NAME";; esac
+            case "$NAME" in
+              abstract|as|assert|async|await|break|case|catch|class|const|continue|covariant|default|deferred|do|dynamic|else|enum|export|extends|extension|external|extern|factory|false|final|finally|for|function|get|hide|if|implements|import|in|interface|is|late|library|mixin|new|null|of|on|operator|part|required|rethrow|return|set|show|static|super|switch|sync|this|throw|true|try|typedef|var|void|while|with|yield|flutter|flutter_test|flutter_driver|flutter_localizations|integration_test|test|dart) NAME="${NAME}_app";;
+            esac
+            mkdir -p ../keep && cp -a pubspec.yaml ../keep/pubspec.yaml
+            [ -d lib ] && cp -a lib ../keep/lib || true
+            flutter create --project-name "$NAME" --org com.example --platforms=android --no-pub .
+            cp -a ../keep/pubspec.yaml pubspec.yaml
+            if [ -d ../keep/lib ]; then rm -rf lib && cp -a ../keep/lib lib; fi
+            if ! grep -q "android.permission.INTERNET" android/app/src/main/AndroidManifest.xml; then
+              sed -i '0,/<manifest[^>]*>/s//&\n    <uses-permission android:name="android.permission.INTERNET"\/>/' android/app/src/main/AndroidManifest.xml
+            fi
+          fi
+
+          # foto icon: assets/icon/icon.jpg -> icon APK / iPhone (dipakai kalau file-nya ada)
+          if ls assets/icon/ 2>/dev/null | grep -qiE '^icon\.(jpg|jpeg|png)$'; then
+            python3 -c "import PIL" 2>/dev/null || pip install -q pillow || pip install -q --break-system-packages pillow
+          PROJECT_DIR=. python3 - <<'PY'
+          import json, os, re
+          from PIL import Image, ImageDraw, ImageOps
+
+          ROOT = os.environ.get('PROJECT_DIR', 'flutter-project')
+
+          # --- cari foto icon: assets/icon/icon.jpg (cadangan: icon.jpeg / icon.png) ---
+          src = None
+          d = os.path.join(ROOT, 'assets', 'icon')
+          if os.path.isdir(d):
+              for want in ('icon.jpg', 'icon.jpeg', 'icon.png'):
+                  for f in sorted(os.listdir(d)):
+                      if f.lower() == want:
+                          src = os.path.join(d, f)
+                          break
+                  if src:
+                      break
+          if not src:
+              print('assets/icon/icon.jpg tidak ada, icon bawaan project dipakai')
+              raise SystemExit(0)
+
+          im = ImageOps.exif_transpose(Image.open(src)).convert('RGBA')
+          w, h = im.size
+          s = min(w, h)
+          im = im.crop(((w - s) // 2, (h - s) // 2, (w - s) // 2 + s, (h - s) // 2 + s))  # potong tengah jadi persegi
+          print('Foto icon: %s (%dx%d -> %dx%d)' % (src, w, h, s, s))
+
+          def resized(size):
+              return im.resize((size, size), Image.LANCZOS)
+
+          def circle(img):
+              size = img.size[0]
+              mask = Image.new('L', (size * 4, size * 4), 0)
+              ImageDraw.Draw(mask).ellipse((0, 0, size * 4 - 1, size * 4 - 1), fill=255)
+              img = img.copy()
+              img.putalpha(mask.resize((size, size), Image.LANCZOS))
+              return img
+
+          # ================= ANDROID =================
+          main = os.path.join(ROOT, 'android', 'app', 'src', 'main')
+          manifest = os.path.join(main, 'AndroidManifest.xml')
+          res = os.path.join(main, 'res')
+          if os.path.isfile(manifest):
+              t = open(manifest, encoding='utf-8', errors='surrogateescape').read()
+              orig = t
+              m = re.search(r'android:icon="@(mipmap|drawable)/([A-Za-z0-9_]+)"', t)
+              if m and m.group(1) == 'mipmap':
+                  name = m.group(2)
+              else:
+                  name = 'ic_launcher'
+                  if m:
+                      t = t.replace(m.group(0), 'android:icon="@mipmap/ic_launcher"')
+                  else:
+                      t = re.sub(r'<application\b', '<application android:icon="@mipmap/ic_launcher"', t, count=1)
+              m2 = re.search(r'android:roundIcon="@(mipmap|drawable)/([A-Za-z0-9_]+)"', t)
+              if m2 and m2.group(1) == 'mipmap':
+                  rname = m2.group(2)
+              else:
+                  rname = name + '_round'
+                  if m2:
+                      t = t.replace(m2.group(0), 'android:roundIcon="@mipmap/%s"' % rname)
+              if t != orig:
+                  open(manifest, 'w', encoding='utf-8', errors='surrogateescape').write(t)
+
+              os.makedirs(res, exist_ok=True)
+              # buang icon lama (png/webp/jpg/xml adaptive) supaya tidak bentrok / menimpa foto kita
+              for dn in os.listdir(res):
+                  if not dn.startswith('mipmap-'):
+                      continue
+                  for fn in os.listdir(os.path.join(res, dn)):
+                      base, ext = os.path.splitext(fn)
+                      if base in (name, rname) and ext.lower() in ('.png', '.webp', '.jpg', '.jpeg', '.xml'):
+                          os.remove(os.path.join(res, dn, fn))
+              for dpi, px in (('mdpi', 48), ('hdpi', 72), ('xhdpi', 96), ('xxhdpi', 144), ('xxxhdpi', 192)):
+                  dd = os.path.join(res, 'mipmap-' + dpi)
+                  os.makedirs(dd, exist_ok=True)
+                  resized(px).save(os.path.join(dd, name + '.png'), 'PNG')
+                  circle(resized(px)).save(os.path.join(dd, rname + '.png'), 'PNG')
+              print('Android: icon diterapkan (mipmap/%s + %s)' % (name, rname))
+          else:
+              print('Android: AndroidManifest.xml tidak ada, dilewati')
+
+          # ================= iOS =================
+          ap = os.path.join(ROOT, 'ios', 'Runner', 'Assets.xcassets', 'AppIcon.appiconset')
+          cj = os.path.join(ap, 'Contents.json')
+          if os.path.isfile(cj):
+              data = json.load(open(cj, encoding='utf-8'))
+              flat = Image.new('RGB', im.size, (255, 255, 255))  # icon iOS tidak boleh transparan
+              flat.paste(im, mask=im.split()[3])
+              n = 0
+              for it in data.get('images', []):
+                  fn = it.get('filename')
+                  if not fn:
+                      continue
+                  try:
+                      px = int(round(float(it['size'].split('x')[0]) * int(str(it.get('scale', '1x')).rstrip('x'))))
+                  except Exception:
+                      continue
+                  flat.resize((px, px), Image.LANCZOS).save(os.path.join(ap, fn), 'PNG')
+                  n += 1
+              print('iOS: %d file AppIcon diganti' % n)
+          else:
+              print('iOS: AppIcon.appiconset tidak ada, dilewati')
+          PY
+          fi
+
+          mkdir -p android
+          cat >> android/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx4g -XX:+UseParallelGC -XX:MaxMetaspaceSize=1g
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          org.gradle.configureondemand=true
+          org.gradle.daemon=false
+          kotlin.incremental=false
+          kotlin.compiler.execution.strategy=in-process
+          EOF
+
+          # pub get; kalau gagal karena constraint SDK, longgarkan 1x lalu ulangi
+          if ! flutter pub get 2>&1 | tee ../pubget.log; then
+            if grep -qiE "requires SDK version|requires Dart SDK|SDK constraint|version solving failed" ../pubget.log; then
+              echo "Melonggarkan constraint SDK di pubspec.yaml, ulangi pub get"
+              python3 - <<'PY'
+          import re
+          t = open('pubspec.yaml', encoding='utf-8', errors='ignore').read()
+          t = re.sub(r'(^environment:[ \t]*\n(?:[ \t]+[^\n]*\n)*?[ \t]+sdk:[ \t]*)[^\n]+', lambda m: m.group(1) + '">=3.0.0 <4.0.0"', t, count=1, flags=re.M)
+          t = re.sub(r'^dependency_overrides:[ \t]*\n(?:[ \t]+[^\n]*\n?)*', '', t, flags=re.M)
+          open('pubspec.yaml', 'w', encoding='utf-8').write(t)
+          PY
+              rm -f pubspec.lock
+              flutter pub get
+            else
+              exit 1
+            fi
+          fi
+
+          run_build() {
+            flutter build apk --release --target-platform android-arm64 --no-pub --no-tree-shake-icons 2>&1 | tee ../build.log
+          }
+
+          if ! run_build; then
+            if grep -qiE "aapt2|file failed to compile|AAPT: error" ../build.log; then
+              echo "Icon bermasalah (AAPT2), re-encode PNG lalu ulangi build"
+              sudo apt-get install -y -qq imagemagick >/dev/null
+              for DIR in android/app/src/main/res/mipmap-*; do
+                [ -d "$DIR" ] || continue
+                for IMG in "$DIR"/*.png; do
+                  [ -f "$IMG" ] || continue
+                  if identify "$IMG" >/dev/null 2>&1; then
+                    convert "$IMG" -strip "PNG32:${IMG}.tmp" && mv "${IMG}.tmp" "$IMG" || true
+                  else
+                    convert -size 96x96 xc:"#2196F3" "PNG32:$IMG"
+                  fi
+                done
+              done
+            elif grep -qiE "licen[sc]e" ../build.log; then
+              echo "Menerima lisensi Android SDK lalu ulangi build"
+              (yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1) || true
+            else
+              exit 1
+            fi
+            run_build
+          fi
+
+      - name: Sign APK
+        shell: bash
+        run: |
+          set -e
+          APK=$(ls flutter-project/build/app/outputs/flutter-apk/*.apk | head -n 1)
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
+          keytool -genkeypair -keystore release.keystore -alias release -keyalg RSA -keysize 2048 -validity 10000 -storepass password -keypass password -dname "CN=BuildBot, OU=Dev, O=BuildBot, C=ID" >/dev/null 2>&1
+          "$BT/apksigner" sign --ks release.keystore --ks-pass pass:password --key-pass pass:password "$APK"
+          "$BT/apksigner" verify "$APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: flutter-project/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
